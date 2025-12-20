@@ -2,83 +2,203 @@ import socket
 import threading
 import secrets
 import string
+import os
+import logging
+from flask import Flask, render_template_string
 
-# --- MVP CONFIGURATION ---
+# ------------------ LOGGING ------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s"
+)
+
+# ------------------ CHAT CONFIG ------------------
+
 def generate_credentials(length=10):
     chars = string.ascii_letters + string.digits
     return ''.join(secrets.choice(chars) for _ in range(length))
 
-# Generate 2 Users automatically
 USER1_NAME = "user_" + generate_credentials(4)
 USER1_PASS = generate_credentials(12)
 
 USER2_NAME = "user_" + generate_credentials(4)
 USER2_PASS = generate_credentials(12)
 
-# Map them to each other
 USER_DB = {
     USER1_NAME: {"password": USER1_PASS, "target": USER2_NAME},
     USER2_NAME: {"password": USER2_PASS, "target": USER1_NAME}
 }
 
 active_clients = {}
+client_lock = threading.Lock()
+
+# ------------------ CHAT HANDLER ------------------
 
 def handle_client(conn, addr):
-    try:
-        conn.send(b"AUTH_REQ")
-        auth_data = conn.recv(1024).decode().split(":")
-        
-        if len(auth_data) != 2: return
-        username, password = auth_data[0], auth_data[1]
+    username = None
+    conn.settimeout(60)
 
-        if username in USER_DB and USER_DB[username]["password"] == password:
-            print(f"[AUTH] {username} logged in from {addr[0]}")
+    try:
+        conn.sendall(b"AUTH_REQ")
+        auth_data = conn.recv(1024).decode().strip().split(":")
+
+        if len(auth_data) != 2:
+            return
+
+        username, password = auth_data
+
+        if USER_DB.get(username, {}).get("password") != password:
+            conn.sendall(b"AUTH_FAILED")
+            return
+
+        logging.info(f"[AUTH] {username} from {addr[0]}")
+
+        with client_lock:
             active_clients[username] = conn
-            conn.send(b"AUTH_SUCCESS")
-            
-            while True:
-                message = conn.recv(4096)
-                if not message: break
-                
-                target_user = USER_DB[username]["target"]
-                if target_user in active_clients:
-                    print(f"[RELAY] {username} -> {target_user} ({len(message)} bytes)")
-                    active_clients[target_user].send(f"\n[{username}]: ".encode() + message + b"\nChat > ")
-                else:
-                    conn.send(b"\n[SYSTEM] Target user is currently offline.\nChat > ")
-        else:
-            print(f"[AUTH FAIL] Unauthorized access attempt from {addr[0]}")
-            conn.send(b"AUTH_FAILED")
-    except:
-        pass
+
+        conn.sendall(b"AUTH_SUCCESS")
+
+        while True:
+            msg = conn.recv(4096)
+            if not msg:
+                break
+
+            target = USER_DB[username]["target"]
+
+            with client_lock:
+                target_conn = active_clients.get(target)
+
+            if target_conn:
+                target_conn.sendall(
+                    f"\n[{username}]: ".encode() + msg
+                )
+            else:
+                conn.sendall(b"\n[SYSTEM] Target offline.")
+
+    except Exception as e:
+        logging.error(f"[CHAT ERROR] {e}")
     finally:
-        if 'username' in locals() and username in active_clients:
-            del active_clients[username]
+        with client_lock:
+            if username in active_clients:
+                del active_clients[username]
         conn.close()
 
-def start_server():
-    # Get Local IP
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-    
+def start_chat_server():
+    chat_port = 5555  # internal only
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('0.0.0.0', 5555))
-    server.listen(2)
+    server.bind(("0.0.0.0", chat_port))
+    server.listen(10)
 
-    print("="*50)
-    print(f"SECURECHAT SERVER ACTIVE")
-    print(f"SERVER IP: {local_ip}")
-    print("="*50)
-    print(f"USER A: {USER1_NAME}  |  PASS: {USER1_PASS}")
-    print(f"USER B: {USER2_NAME}  |  PASS: {USER2_PASS}")
-    print(f"Targeting: {USER1_NAME} <--> {USER2_NAME}")
-    print("="*50)
+    logging.info(f"[CHAT] Listening internally on {chat_port}")
 
     while True:
         conn, addr = server.accept()
-        print(f"[LOG] Connection from {addr[0]}")
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        threading.Thread(
+            target=handle_client,
+            args=(conn, addr),
+            daemon=True
+        ).start()
+
+# ------------------ FLASK WEB ------------------
+
+app = Flask(__name__)
+
+F1_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Slipstream F1 | Formula One Fans</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #0b0b0b;
+            color: #f2f2f2;
+        }
+        header {
+            background: #e10600;
+            padding: 20px;
+            text-align: center;
+        }
+        section {
+            max-width: 900px;
+            margin: auto;
+            padding: 40px;
+            line-height: 1.6;
+        }
+        h1, h2 {
+            text-transform: uppercase;
+        }
+        .card {
+            background: #1a1a1a;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        footer {
+            text-align: center;
+            font-size: 0.8em;
+            color: #aaa;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+<header>
+    <h1>Slipstream F1</h1>
+    <p>Pure Formula One. No DRS excuses.</p>
+</header>
+
+<section>
+    <div class="card">
+        <h2>About Us</h2>
+        <p>
+            Slipstream F1 is a fan-driven Formula One hub focused on race analysis,
+            driver rivalries, and the uncomfortable truth that strategy calls
+            win championships.
+        </p>
+    </div>
+
+    <div class="card">
+        <h2>What We Cover</h2>
+        <ul>
+            <li>Race weekend breakdowns</li>
+            <li>Telemetry-inspired analysis</li>
+            <li>Driver and team performance trends</li>
+            <li>Why your favorite team bottled it</li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h2>Current Season</h2>
+        <p>
+            Ground effect era. Margins measured in milliseconds.
+            Everyone swears next upgrade fixes everything.
+        </p>
+    </div>
+</section>
+
+<footer>
+    &copy; 2025 Slipstream F1. Unofficial. Loud opinions only.
+</footer>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(F1_HTML)
+
+# ------------------ ENTRY ------------------
 
 if __name__ == "__main__":
-    start_server()
+    # Start chat server in background
+    threading.Thread(target=start_chat_server, daemon=True).start()
+
+    # Start Flask on public port
+    port = int(os.environ.get("PORT", 5000))
+    logging.info(f"[WEB] F1 site running on port {port}")
+    app.run(host="0.0.0.0", port=port)
